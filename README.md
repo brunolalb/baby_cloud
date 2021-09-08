@@ -1,7 +1,8 @@
 # Single Cloud
 LED Strip Cloud project. 
 Single Cloud. 
-Arduino Nano ATmega328. 
+ESP32.
 LED Strip WS2812B.
+MQTT + WebOTA
 
-Code written in Rust using VS Code
+Code on Arduino
