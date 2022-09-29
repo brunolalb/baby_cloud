@@ -19,6 +19,7 @@ I also have a NodeRED MQTT Dashboard for fancy reporting and UI
 
 // wifi stuff
 #include <WiFi.h>
+#include <WiFiGeneric.h>
 // FreeRTOS - official FreeRTOS lib
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -38,6 +39,7 @@ I also have a NodeRED MQTT Dashboard for fancy reporting and UI
 // debug stuff
 SemaphoreHandle_t semph_debug; // controls access to the debug stuff
 #define CLOUD_TEST
+#define DEBUG
 
 
 /* WiFi */
@@ -78,11 +80,14 @@ AsyncWebServer server(80);
 #define LED_STRIP_LED_COUNT             45
 #endif
 Adafruit_NeoPixel led_strip = Adafruit_NeoPixel(LED_STRIP_LED_COUNT, LED_STRIP_DATA_PIN, NEO_GRB + NEO_KHZ800);
-#define LED_STRIP_INITIAL_BRIGHTNESS    10 // up to 255
+#define LED_STRIP_INITIAL_BRIGHTNESS    0 // up to LED_STRIP_MAX_BRIGHTNESS
 #define LED_STRIP_INITIAL_ONOFF         false
-#define LED_STRIP_INITIAL_COLOR_R       255
-#define LED_STRIP_INITIAL_COLOR_G       255
-#define LED_STRIP_INITIAL_COLOR_B       255
+#define LED_STRIP_INITIAL_COLOR_R       0
+#define LED_STRIP_INITIAL_COLOR_G       0
+#define LED_STRIP_INITIAL_COLOR_B       0
+
+#define LED_STRIP_MAX_VALUE             255
+#define LED_STRIP_MAX_BRIGHTNESS        255
 typedef struct {
   bool enabled;
   byte r;
@@ -90,17 +95,22 @@ typedef struct {
   byte b;
   byte brightness;
 } pixel_t;
-pixel_t pixels[LED_STRIP_LED_COUNT];
+pixel_t pixels_current[LED_STRIP_LED_COUNT];
+pixel_t pixels_raw[LED_STRIP_LED_COUNT];
+pixel_t pixels_target[LED_STRIP_LED_COUNT];
+#define LED_STRIP_UPDATE_PERIOD_MS      50
+#define LED_STRIP_SMOOTHNESS_RATE       2
 
 
 /* MQTT */
 AsyncMqttClient mqttClient;
 TimerHandle_t mqttReconnectTimer;
 SemaphoreHandle_t semph_mqtt;
+bool mqtt_connected;
 // some config
-#define MQTT_MY_NAME      WIFI_HOSTNAME
-#define MQTT_SERVER_IP    IPAddress(192, 168, 1, 42)
-#define MQTT_SERVER_PORT  1883
+#define MQTT_MY_NAME            WIFI_HOSTNAME
+#define MQTT_SERVER_IP          IPAddress(192, 168, 1, 42)
+#define MQTT_SERVER_PORT        1883
 #define MQTT_PUBLISH_RETAINED   true  // if true, will publish all messages with the retain flag
 #define MQTT_PUBLISH_QOS        0     // QOS level for published messages
 #define MQTT_SUBSCRIBE_QOS      0     // QOS level for subscribed topics
@@ -128,6 +138,7 @@ char global_buffer[20];
  * Debug
  ****************************************/
 
+#ifdef DEBUG
 void debug(char *msg) 
 {
   if (xPortInIsrContext()) {
@@ -153,6 +164,16 @@ void setup_debug()
   semph_debug = xSemaphoreCreateMutex();
   xSemaphoreGive(semph_debug);
 }
+#else
+void debug(char *msg) {
+}
+void debug_nonFreeRTOS(char *msg) {
+}
+void setup_debug() {
+}
+#endif
+
+
 
 /****************************************
  * WiFi
@@ -171,15 +192,15 @@ void setup_WiFi()
 
   delay(1000);
 
-  WiFi.onEvent(WiFiStationStarted, SYSTEM_EVENT_STA_START);
-  WiFi.onEvent(WiFiStationConnected, SYSTEM_EVENT_STA_CONNECTED);
-  WiFi.onEvent(WiFiGotIP, SYSTEM_EVENT_STA_GOT_IP);
-  WiFi.onEvent(WiFiStationDisconnected, SYSTEM_EVENT_STA_DISCONNECTED);
+  WiFi.onEvent(WiFiStationStarted, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_START);
+  WiFi.onEvent(WiFiStationConnected, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_CONNECTED);
+  WiFi.onEvent(WiFiGotIP, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_GOT_IP);
+  WiFi.onEvent(WiFiStationDisconnected, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
 
   WiFi.mode(WIFI_STA);
 
   // one shot timer
-  wifiReconnectTimer = xTimerCreate("wifiTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(reconnectToWifi));
+  wifiReconnectTimer = xTimerCreate("wifiTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)2, reinterpret_cast<TimerCallbackFunction_t>(reconnectToWifi));
 }
 
 void reconnectToWifi()
@@ -223,7 +244,7 @@ void WiFiStationDisconnected(WiFiEvent_t event, WiFiEventInfo_t info)
 
   LED_WIFI_ON();
 
-  snprintf(msg, 50, "Disconnected from WiFi: %u", info.disconnected.reason);
+  snprintf(msg, 50, "Disconnected from WiFi: %u", info.wifi_sta_disconnected.reason);
   debug(msg);
 
   // stop the mqtt reconnect timer to ensure we don't reconnect to MQTT while reconnecting to Wi-Fi
@@ -239,12 +260,14 @@ void WiFiStationDisconnected(WiFiEvent_t event, WiFiEventInfo_t info)
  ****************************************/
 void setup_MQTT() 
 {
+  mqtt_connected = false;
+
   // one shot timer
   mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(reconnectToMqtt));
 
   // semaphore to prevent simultaneous access
   semph_mqtt = xSemaphoreCreateMutex();
-  xSemaphoreGive(semph_mqtt);  
+  xSemaphoreGive(semph_mqtt);
   
   mqttClient.onConnect(onMqttConnect);
   mqttClient.onDisconnect(onMqttDisconnect);
@@ -262,6 +285,7 @@ void setup_MQTT()
 void reconnectToMqtt() 
 {
   debug("Connecting to MQTT...");
+  delay(50);
   mqttClient.connect();
 }
 
@@ -297,27 +321,38 @@ void onMqttConnect(bool sessionPresent)
   packetIdSub = mqttClient.subscribe(MQTT_TOPIC_STRIP_B, MQTT_SUBSCRIBE_QOS);
   snprintf(msg, 100, "Subscribing at QoS %u, topic %s, packetId %u", MQTT_SUBSCRIBE_QOS, MQTT_TOPIC_STRIP_B, packetIdSub);
   debug(msg);
-  packetIdSub = mqttClient.subscribe(MQTT_TOPIC_STRIP_HEX, MQTT_SUBSCRIBE_QOS);
-  snprintf(msg, 100, "Subscribing at QoS %u, topic %s, packetId %u", MQTT_SUBSCRIBE_QOS, MQTT_TOPIC_STRIP_HEX, packetIdSub);
-  debug(msg);
+  //packetIdSub = mqttClient.subscribe(MQTT_TOPIC_STRIP_HEX, MQTT_SUBSCRIBE_QOS);
+  //snprintf(msg, 100, "Subscribing at QoS %u, topic %s, packetId %u", MQTT_SUBSCRIBE_QOS, MQTT_TOPIC_STRIP_HEX, packetIdSub);
+  //debug(msg);
   packetIdSub = mqttClient.subscribe(MQTT_TOPIC_STRIP_BRIGHTNESS, MQTT_SUBSCRIBE_QOS);
   snprintf(msg, 100, "Subscribing at QoS %u, topic %s, packetId %u", MQTT_SUBSCRIBE_QOS, MQTT_TOPIC_STRIP_BRIGHTNESS, packetIdSub);
   debug(msg);
+
+  mqtt_connected = true;
 }
 
 void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) 
 {
-  debug("Disconnected from MQTT.");
+  char msg[100];
+  
+  mqtt_connected = false;
+
+  snprintf(msg, 100, "Disconnected from MQTT. Reason: %u", static_cast<uint8_t>(reason));
+  debug(msg);
+  
   if (WiFi.isConnected()) {
     // didn't disconnect because the wifi stopped, so try to connect again    
+    debug("Wifi still connected.");
     xTimerStart(mqttReconnectTimer, 0);
+    debug("Timer restarted.");
   }
 }
 
 bool mqtt_publish(char *topic, char *payload)
 {
+  debug("mqtt_publish");
   if (xSemaphoreTake(semph_mqtt, pdMS_TO_TICKS(100)) == pdTRUE) {
-    if (mqttClient.connected()) {
+    if (mqtt_connected) {
       mqttClient.publish(topic, MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAINED, payload);
       xSemaphoreGive(semph_mqtt);      
     } else {
@@ -334,6 +369,8 @@ void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties 
 {
   char msg[200];
   char new_payload[20];
+  uint8_t data_u8 = 0;
+
   snprintf(new_payload, 20, "%s", payload);
   new_payload[len] = 0;
   snprintf(msg, 200, "Message received: %s\r\n payload (%u bytes): %s", 
@@ -342,35 +379,42 @@ void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties 
   
   #ifdef CLOUD_TEST
   if (String(topic) == String(MQTT_TOPIC_LED_R)) {
-    (payload[0] == '1') ? LED_R_ON() : LED_R_OFF();
+    (new_payload[0] == '1') ? LED_R_ON() : LED_R_OFF();
   } else if (String(topic) == String(MQTT_TOPIC_LED_G)) {
-    (payload[0] == '1') ? LED_G_ON() : LED_G_OFF();
+    (new_payload[0] == '1') ? LED_G_ON() : LED_G_OFF();
   } else if (String(topic) == String(MQTT_TOPIC_LED_B)) {
-    (payload[0] == '1') ? LED_B_ON() : LED_B_OFF();
+    (new_payload[0] == '1') ? LED_B_ON() : LED_B_OFF();
   } else 
   #endif
   if (String(topic) == String(MQTT_TOPIC_STRIP_ON_OFF)) {
-    setAllPixelsOnOff(payload[0] == '1' ? true : false);
-  } else if (String(topic) == String(MQTT_TOPIC_STRIP_BRIGHTNESS)) {
-    payload[len] = 0;
-    setAllPixelsBrightness(strtol((char *)payload, NULL, 10));
+    setAllPixelsOnOff(new_payload[0] == '1' ? true : false);
+  } else if (String(topic) == String(MQTT_TOPIC_STRIP_BRIGHTNESS)) {      
+    setAllPixelsBrightness((uint8_t)strtoul((char *)new_payload, NULL, 10));
   } else if (String(topic) == String(MQTT_TOPIC_STRIP_R)) {
-    setColorAllPixelsRed(strtol((char *)payload, NULL, 10));
+    setColorAllPixelsRed((uint8_t)strtoul((char *)new_payload, NULL, 10));
   } else if (String(topic) == String(MQTT_TOPIC_STRIP_G)) {
-    setColorAllPixelsGreen(strtol((char *)payload, NULL, 10));
+    setColorAllPixelsGreen((uint8_t)strtoul((char *)new_payload, NULL, 10));
   } else if (String(topic) == String(MQTT_TOPIC_STRIP_B)) {
-    setColorAllPixelsBlue(strtol((char *)payload, NULL, 10));
+    setColorAllPixelsBlue((uint8_t)strtoul((char *)new_payload, NULL, 10));
   } else if (String(topic) == String(MQTT_TOPIC_STRIP_HEX)) {
     //to RGB
-    payload[len] = 0;
-    unsigned long int rgb=strtol((char *)&payload[1], NULL, 16);
+    unsigned long int rgb=strtoul((char *)&new_payload[1], NULL, 16);
     byte r=(byte)((rgb >> 16) & 0xFF);
     byte g=(byte)((rgb >> 8) & 0xFF);
     byte b=(byte) (rgb & 0xFF);
     setColorAllPixels(r, g, b);
+
+    snprintf(msg, 200, "done");
+    debug(msg);
+    return;
+
   } else {
     // i don't know ...
+    snprintf(msg, 200, "I dont know");
+    debug(msg);
+    return;
   }
+
 }
 
 /****************************************
@@ -378,6 +422,7 @@ void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties 
  ****************************************/
 void reconnectToOta()
 {
+  debug("reconnectToOta");
   /*use mdns for host name resolution*/
   if (!MDNS.begin(WIFI_HOSTNAME)) { //http://<hostname>.local
     debug("Error setting up MDNS responder!");
@@ -397,7 +442,7 @@ void reconnectToOta()
 void setup_OTA_Updates()
 {
 
-  otaReconnectTimer = xTimerCreate("otaTimer", pdMS_TO_TICKS(5000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(reconnectToOta));
+  otaReconnectTimer = xTimerCreate("otaTimer", pdMS_TO_TICKS(5000), pdFALSE, (void*)1, reinterpret_cast<TimerCallbackFunction_t>(reconnectToOta));
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "text/plain", "Hi! I am ESP32.");
@@ -414,128 +459,166 @@ void setup_LED_Strip()
   pinMode(LED_STRIP_DATA_PIN, OUTPUT);
   led_strip.begin();
   //led_strip.setBrightness(LED_STRIP_INITIAL_BRIGHTNESS);
-  memset(pixels, 0, LED_STRIP_LED_COUNT * sizeof(pixel_t));
+  memset(pixels_current, 0, LED_STRIP_LED_COUNT * sizeof(pixel_t));
+  memset(pixels_raw, 0, LED_STRIP_LED_COUNT * sizeof(pixel_t));
+  memset(pixels_target, 0, LED_STRIP_LED_COUNT * sizeof(pixel_t));
   setColorAllPixels(LED_STRIP_INITIAL_COLOR_R, LED_STRIP_INITIAL_COLOR_G, LED_STRIP_INITIAL_COLOR_B);
   setAllPixelsBrightness(LED_STRIP_INITIAL_BRIGHTNESS);
   setAllPixelsOnOff(LED_STRIP_INITIAL_ONOFF);
+
+  xTaskCreate(LEDStrip_Task,
+              (const char *)"LED Strip",
+              2048,  // Stack size
+              NULL,
+              2,  // priority
+              NULL );
 }
 
 void setColorAllPixels(byte red, byte green, byte blue) 
 {
-  Serial.print("setColorAllPixels: ");
-  Serial.print(red);
-  Serial.print(", ");
-  Serial.print(green);
-  Serial.print(", ");
-  Serial.println(blue);
+  char msg[100];
+  snprintf(msg, 100, "setColorAllPixels: %u, %u, %u", red, green, blue);
+  debug(msg);
 
   for (byte i=0; i < LED_STRIP_LED_COUNT; i++) {
-    float ratio = (float)pixels[i].brightness / 255.0;
-    pixels[i].r = red;
-    pixels[i].g = green;
-    pixels[i].b = blue;
-    if (pixels[i].enabled)
-      led_strip.setPixelColor(i, led_strip.Color((byte)((float)pixels[i].r * ratio), 
-                                                 (byte)((float)pixels[i].g * ratio),
-                                                 (byte)((float)pixels[i].b * ratio)));
-    else
-      led_strip.setPixelColor(i, led_strip.Color(0, 0, 0));    
+    pixels_target[i].r = red;
+    pixels_target[i].g = green;
+    pixels_target[i].b = blue;
   }
-
-  led_strip.show();
-  delay(50);
 }
 
 void setColorAllPixelsRed(byte red) 
 {
-  for (byte i=0; i < LED_STRIP_LED_COUNT; i++) {
-    float ratio = (float)pixels[i].brightness / 255.0;
-    pixels[i].r = red;
-    if (pixels[1].enabled)
-      led_strip.setPixelColor(i, led_strip.Color((byte)((float)pixels[i].r * ratio), 
-                                                 (byte)((float)pixels[i].g * ratio),
-                                                 (byte)((float)pixels[i].b * ratio)));
-  }
-
-  led_strip.show();
+  for (byte i=0; i < LED_STRIP_LED_COUNT; i++)
+    pixels_target[i].r = red;
 }
 
 void setColorAllPixelsGreen(byte green) 
 {
-  for (byte i=0; i < LED_STRIP_LED_COUNT; i++) {
-    float ratio = (float)pixels[i].brightness / 255.0;
-    pixels[i].g = green;
-    if (pixels[1].enabled)
-      led_strip.setPixelColor(i, led_strip.Color((byte)((float)pixels[i].r * ratio), 
-                                                 (byte)((float)pixels[i].g * ratio),
-                                                 (byte)((float)pixels[i].b * ratio)));
-  }
-
-  led_strip.show();
+  for (byte i=0; i < LED_STRIP_LED_COUNT; i++)
+    pixels_target[i].g = green;
 }
 
 void setColorAllPixelsBlue(byte blue) 
 {
-  led_strip.clear();
-
-  for (byte i=0; i < LED_STRIP_LED_COUNT; i++) {
-    float ratio = (float)pixels[i].brightness / 255.0;
-    pixels[i].b = blue;
-    if (pixels[1].enabled)
-      led_strip.setPixelColor(i, led_strip.Color((byte)((float)pixels[i].r * ratio), 
-                                                 (byte)((float)pixels[i].g * ratio),
-                                                 (byte)((float)pixels[i].b * ratio)));
-  }
-
-  led_strip.show();
+  for (byte i=0; i < LED_STRIP_LED_COUNT; i++)
+    pixels_target[i].b = blue;
 }
 
 void setAllPixelsBrightness(byte brightness)
 {
-  float ratio = (float)brightness / 255.0;
-  
-  Serial.print("setBrightness: ");
-  Serial.println(brightness);
+  char msg[50];
+  snprintf(msg, 50, "setBrightness: %u", brightness);
+  debug(msg);
 
-  for (byte i=0; i < LED_STRIP_LED_COUNT; i++) {
-    pixels[i].brightness = brightness;
-    if (pixels[1].enabled)
-      led_strip.setPixelColor(i, led_strip.Color((byte)((float)pixels[i].r * ratio), 
-                                                 (byte)((float)pixels[i].g * ratio),
-                                                 (byte)((float)pixels[i].b * ratio)));
-  }
-
-  led_strip.show();
-  delay(50);
+  for (byte i=0; i < LED_STRIP_LED_COUNT; i++)
+    pixels_target[i].brightness = brightness;
 }
 
 void setAllPixelsOnOff(bool enable)
 {
-  char msg[10];
-
-  Serial.print("setAllPixelsOnOff: ");
-  if (enable) Serial.println("Enable");
-  else Serial.println("Disable");
+  char msg[50];
+  snprintf(msg, 50, "setAllPixelsOnOff: %s", (enable) ? "Enabled" : "Disable");
+  debug(msg);
   
-  for (byte i=0; i < LED_STRIP_LED_COUNT; i++) {
-    pixels[i].enabled = enable;
-    if (enable) {
-      Serial.print(i); Serial.print(": ");
-      Serial.print(pixels[i].r); Serial.print(", ");
-      Serial.print(pixels[i].g); Serial.print(", ");
-      Serial.println(pixels[i].b);
-      float ratio = (float)pixels[i].brightness / 255.0;
-      led_strip.setPixelColor(i, led_strip.Color((byte)((float)pixels[i].r * ratio), 
-                                                 (byte)((float)pixels[i].g * ratio),
-                                                 (byte)((float)pixels[i].b * ratio)));
-    } else
-      led_strip.setPixelColor(i, led_strip.Color(0, 0, 0));
-  }
-  led_strip.show();
-  delay(50);
+  for (byte i=0; i < LED_STRIP_LED_COUNT; i++)
+    pixels_target[i].enabled = enable;
 
   snprintf (msg, 10, "%u", enable ? 1 : 0);
   mqtt_publish(MQTT_TOPIC_STRIP_ON_OFF_FEEDBACK, msg);
+}
+
+
+void LEDStrip_smoothly_match(uint8_t target, uint8_t *current)
+{
+  uint16_t target16 = (uint16_t)target;
+  uint16_t current16 = (uint16_t)*current;
+
+  if (current16 > target16) {
+    if (current16 > (target16 + LED_STRIP_SMOOTHNESS_RATE)) {
+      current16 -= LED_STRIP_SMOOTHNESS_RATE;
+    } else {
+      current16 = target16;
+    }
+  } else if (current16 < target16) {
+    if (target16 > (current16 + LED_STRIP_SMOOTHNESS_RATE)) {
+      current16 += LED_STRIP_SMOOTHNESS_RATE;
+    } else {
+      current16 = target16;
+    }
+  }
+
+  if (current16 > 0x00FF) {
+    char msg[200];
+    snprintf(msg, 200, "LEDStrip_smoothly_match: weird %u, %lu, %u, %lu", *current, current16, target, target16);
+    debug(msg);
+    current16 = 0x00FF;
+  }
+
+  *current = (uint8_t)current16;
+}
+
+uint8_t LEDStrip_get_raw_color(uint8_t value, uint8_t brightness, uint8_t previous)
+{
+  float valuef = (float)value;
+  float brightnessf = (float)brightness;
+  float ratio;
+  uint8_t new_raw = 0;
+
+  if ((brightness == 0) || (value == 0)) {
+    return 0;
+  }
+
+  ratio = brightnessf / (float)LED_STRIP_MAX_BRIGHTNESS;
+  valuef *= ratio;
+
+  if (valuef < 1) {
+    new_raw = 0;
+  } else {
+    new_raw = int(round(valuef));
+  }
+
+  LEDStrip_smoothly_match(new_raw, &previous);
+
+  return previous;
+  
+}
+
+
+void LEDStrip_Task(void *pvParameters)
+{
+  (void) pvParameters;
+  TickType_t xLastWakeTime;
+  uint8_t red, green, blue;
+  char msg[200];
+
+  red = 0;
+  green = 0;
+  blue = 0;
+  
+  // the objective is to update the strip with the target values
+  xLastWakeTime = xTaskGetTickCount();
+  while(1) {
+    for (uint8_t i=0; i<LED_STRIP_LED_COUNT; i++) {
+      memcpy(&pixels_current[i], &pixels_target[i], sizeof(pixel_t));
+
+      red = LEDStrip_get_raw_color((pixels_current[i].enabled) ? pixels_current[i].r : 0, pixels_current[i].brightness, pixels_raw[i].r);
+      green = LEDStrip_get_raw_color((pixels_current[i].enabled) ? pixels_current[i].g : 0, pixels_current[i].brightness, pixels_raw[i].g);
+      blue = LEDStrip_get_raw_color((pixels_current[i].enabled) ? pixels_current[i].b: 0, pixels_current[i].brightness, pixels_raw[i].b);
+
+      pixels_raw[i].r = red;
+      pixels_raw[i].g = green;
+      pixels_raw[i].b = blue;
+      snprintf(msg, 200, "task: r %u, g %u, b %u", red, green, blue);
+      //debug(msg);
+      led_strip.setPixelColor(i, led_strip.Color(pixels_raw[i].r, pixels_raw[i].g, pixels_raw[i].b));
+    }
+
+    led_strip.show();
+
+    vTaskDelayUntil( &xLastWakeTime, pdMS_TO_TICKS(LED_STRIP_UPDATE_PERIOD_MS));
+  }
+
 }
 
 /****************************************
